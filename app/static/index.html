@@ -101,6 +101,10 @@
 
   <!-- ------------------------------------------------------------------ -->
   <section class="panel" id="drill-panel" hidden>
+    <div class="readonly-banner" id="readonly-banner" hidden>
+      <strong>只读</strong>
+      <span id="readonly-text">演练已交接给接班人，此页面只读。</span>
+    </div>
     <div class="panel-head">
       <h2>3 · 逐步演练</h2>
       <div class="head-actions">
@@ -146,6 +150,23 @@
       </div>
 
       <div class="drill-right">
+        <div class="chart-card" id="handover-box">
+          <h3>交接班</h3>
+          <p class="hint small" id="handover-status">
+            尚未交接。交接后原页面转为只读。
+          </p>
+          <div class="revise-row">
+            <button class="btn primary" id="btn-handover" type="button">
+              生成一次性交接链接
+            </button>
+          </div>
+          <div class="handover-link" id="handover-link" hidden>
+            <input id="handover-url" type="text" readonly />
+            <button class="btn ghost" id="btn-handover-copy" type="button">复制</button>
+            <p class="hint small" id="handover-hint"></p>
+          </div>
+        </div>
+
         <div class="device-grid" id="live-devices"></div>
         <div class="chart-card">
           <h3>演练记录</h3>

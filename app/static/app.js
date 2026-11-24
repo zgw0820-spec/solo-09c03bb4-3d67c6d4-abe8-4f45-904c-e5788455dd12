@@ -9,6 +9,12 @@ const state = {
   session: null,        // last drill snapshot from the API
   preview: null,        // last preview payload
   busy: false,
+  ownerToken: null,     // authenticates the window that may control the drill
+  ownerEpoch: null,
+  readOnly: false,
+  readOnlyReason: "",
+  pollTimer: null,
+  invite: null,
 };
 
 const MAX_DEVICES = 6;
@@ -20,10 +26,18 @@ const $ = (id) => document.getElementById(id);
 // Helpers
 // ---------------------------------------------------------------------------
 
+function authHeaders(extra = {}) {
+  const headers = { "Content-Type": "application/json", ...extra };
+  if (state.ownerToken) headers["X-Operator-Token"] = state.ownerToken;
+  if (state.ownerEpoch !== null) headers["X-Owner-Epoch"] = String(state.ownerEpoch);
+  return headers;
+}
+
 async function api(path, options = {}) {
+  const { headers, ...rest } = options;
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
+    ...rest,
+    headers: authHeaders(headers),
   });
   let payload = null;
   try {
@@ -280,10 +294,11 @@ async function startDrill(event) {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    state.session = session;
+    adoptSession(session, { token: session.owner_token, epoch: session.owner_epoch });
     renderSession();
     $("drill-panel").hidden = false;
     $("drill-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+    startPolling();
   } catch (err) {
     showError(err.message);
   } finally {
@@ -291,6 +306,85 @@ async function startDrill(event) {
     $("btn-start").disabled = false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Session ownership / read-only mode
+// ---------------------------------------------------------------------------
+
+function adoptSession(session, { token = null, epoch = null } = {}) {
+  state.session = session;
+  if (token !== null) state.ownerToken = token;
+  if (epoch !== null) state.ownerEpoch = epoch;
+  else if (session.owner_epoch !== undefined) state.ownerEpoch = session.owner_epoch;
+  if (session.read_only) {
+    state.readOnly = true;
+    state.readOnlyReason = session.read_only_reason || "此页面只读";
+  } else if (session.role !== "successor-preview") {
+    state.readOnly = false;
+    state.readOnlyReason = "";
+  }
+  renderReadOnly();
+  renderHandover();
+}
+
+function renderReadOnly() {
+  const banner = $("readonly-banner");
+  if (!banner) return;
+  banner.hidden = !state.readOnly;
+  if (state.readOnly) {
+    $("readonly-text").textContent =
+      state.readOnlyReason ||
+      "演练已交接给接班人，此页面只读；新的操作请由接班人执行。";
+  }
+}
+
+function renderHandover() {
+  const box = $("handover-box");
+  if (!box) return;
+  const session = state.session;
+  if (!session) {
+    box.hidden = true;
+    return;
+  }
+  const count = session.handover_count || 0;
+  const latest = (session.handovers || []).slice(-1)[0] || session.handover;
+  const bits = [];
+  if (count && latest) {
+    bits.push(
+      `本场演练已完成 <strong>${count}</strong> 次交接；最近一次在第 ` +
+        `<strong>${latest.minute}</strong> 分钟、第 <strong>${latest.step}</strong> 步，` +
+        `${latest.issued_count} 条已生效命令随演练移交。`,
+    );
+    if (state.readOnly) {
+      bits.push("<br />演练已由接班人接手，本页面只读。");
+    }
+  } else {
+    bits.push("尚未交接。交接后原页面转为只读，接班人从新链接继续这场演练。");
+  }
+  $("handover-status").innerHTML = bits.join("");
+  const invite = state.invite;
+  const linkBox = $("handover-link");
+  if (invite && !state.readOnly) {
+    const url = new URL(invite.path, window.location.origin).href;
+    linkBox.hidden = false;
+    $("handover-url").value = url;
+    $("handover-url").dataset.path = invite.path;
+    $("handover-hint").textContent =
+      `一次性链接：打开后接班人先查看第 ${invite.created_minute} 分钟的状态，确认后生效。` +
+      "确认前你仍可继续推进或补录；重新生成会让旧链接失效。";
+    $("btn-handover-copy").disabled = !navigator.clipboard;
+  } else {
+    linkBox.hidden = true;
+  }
+  $("btn-handover").disabled =
+    !session.can_advance || state.busy || state.readOnly;
+}
+
+function canControl() {
+  return !!state.session && !state.readOnly;
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Plan rendering (preview + current session)
@@ -477,11 +571,15 @@ function renderSession() {
   renderRevision(session);
 
   const finished = session.status === "complete";
-  $("btn-step").disabled = !session.can_advance || state.busy;
-  $("btn-next").disabled = !session.can_advance || state.busy;
-  $("btn-finish").disabled = !session.can_advance || state.busy || finished;
-  $("btn-revise").disabled = state.busy;
+  const locked = !canControl();
+  $("btn-step").disabled = !session.can_advance || state.busy || locked;
+  $("btn-next").disabled = !session.can_advance || state.busy || locked;
+  $("btn-finish").disabled = !session.can_advance || state.busy || finished || locked;
+  $("btn-revise").disabled = state.busy || locked;
+  $("revise-input").disabled = locked;
   $("revise-input").value = fmt(session.residual_wh, 1);
+  renderHandover();
+  renderReadOnly();
 
   if (finished) {
     $("clock").textContent = `${session.now}（已全部停妥）`;
@@ -636,10 +734,20 @@ function renderEvents(session) {
       case "complete":
         text = `全部设备停妥，剩余 ${fmt(e.residual_wh)} Wh`;
         break;
+      case "handover_invite":
+        text = `生成第 ${e.handover_no} 次交接的一次性链接（确认前原值班员仍可推进）`;
+        break;
+      case "handover":
+        text =
+          `第 ${e.handover_no} 次交接完成：第 ${e.minute} 分钟（第 ${e.step} 步）` +
+          `由接班人接手，${e.issued_count} 条已生效命令随演练移交`;
+        break;
       default:
         text = e.kind;
     }
-    li.innerHTML = `<span class="t">${e.at}m</span>${escapeHtml(text)}`;
+    const step = e.step !== undefined ? ` · 第 ${e.step} 步` : "";
+    li.innerHTML =
+      `<span class="t">${e.at}m${step}</span> ${escapeHtml(text)}`;
     list.appendChild(li);
   });
 }
@@ -705,14 +813,71 @@ function renderRevision(session) {
 // ---------------------------------------------------------------------------
 
 async function advance(body) {
-  if (!state.session || state.busy) return;
+  if (!state.session || state.busy || !canControl()) return;
   state.busy = true;
+  let refresh = false;
   try {
     const session = await api(`/api/drills/${state.session.id}/advance`, {
       method: "POST",
       body: JSON.stringify(body),
     });
-    state.session = session;
+    adoptSession(session);
+    renderSession();
+  } catch (err) {
+    showError(err.message);
+    refresh = true;
+  } finally {
+    state.busy = false;
+    renderSession();
+  }
+  // A rejected write often means this window was handed over mid-request:
+  // re-read so the page immediately turns read-only.
+  if (refresh) await refreshSession({ quiet: true });
+}
+
+async function revise() {
+  if (!state.session || state.busy || !canControl()) return;
+  const value = Number($("revise-input").value);
+  if (Number.isNaN(value) || value < 0) {
+    showError("请输入有效的余电读数（Wh，≥ 0）");
+    return;
+  }
+  state.busy = true;
+  showError("");
+  $("btn-revise").disabled = true;
+  let refresh = false;
+  try {
+    const session = await api(`/api/drills/${state.session.id}/revise`, {
+      method: "POST",
+      body: JSON.stringify({ residual_wh: value }),
+    });
+    adoptSession(session);
+    renderSession();
+  } catch (err) {
+    showError(err.message);
+    refresh = true;
+  } finally {
+    state.busy = false;
+    renderSession();
+  }
+  if (refresh) await refreshSession({ quiet: true });
+}
+
+// ---------------------------------------------------------------------------
+// Shift handover (outgoing operator)
+// ---------------------------------------------------------------------------
+
+async function issueHandover() {
+  if (!state.session || state.busy || !canControl()) return;
+  state.busy = true;
+  showError("");
+  $("btn-handover").disabled = true;
+  try {
+    const result = await api(`/api/drills/${state.session.id}/handovers`, {
+      method: "POST",
+    });
+    state.invite = result;
+    if (result.session) adoptSession(result.session);
     renderSession();
   } catch (err) {
     showError(err.message);
@@ -722,28 +887,47 @@ async function advance(body) {
   }
 }
 
-async function revise() {
-  if (!state.session || state.busy) return;
-  const value = Number($("revise-input").value);
-  if (Number.isNaN(value) || value < 0) {
-    showError("请输入有效的余电读数（Wh，≥ 0）");
-    return;
-  }
-  state.busy = true;
-  showError("");
-  $("btn-revise").disabled = true;
+async function copyHandoverLink() {
+  const input = $("handover-url");
+  if (!input || !input.value) return;
   try {
-    const session = await api(`/api/drills/${state.session.id}/revise`, {
-      method: "POST",
-      body: JSON.stringify({ residual_wh: value }),
-    });
-    state.session = session;
+    await navigator.clipboard.writeText(input.value);
+    $("handover-hint").textContent = "已复制，发给接班人打开即可。";
+  } catch {
+    input.select();
+  }
+}
+
+// Poll the drill so a window that has been handed over notices it and turns
+// read-only, and so the operator's page reflects the handover in near real
+// time.  Polling only reads; it never touches the drill clock.
+async function refreshSession({ quiet = false } = {}) {
+  const current = state.session;
+  if (!current || state.busy) return;
+  try {
+    const session = await api(`/api/drills/${current.id}`);
+    if (state.busy) return;
+    adoptSession(session);
     renderSession();
   } catch (err) {
-    showError(err.message);
-  } finally {
-    state.busy = false;
-    renderSession();
+    if (err.message.includes("不存在") || err.message.includes("404")) {
+      stopPolling();
+      showError("演练会话已不存在或已过期。");
+      return;
+    }
+    if (!quiet) showError(err.message);
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  state.pollTimer = setInterval(() => refreshSession({ quiet: true }), 4000);
+}
+
+function stopPolling() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
   }
 }
 
@@ -777,6 +961,8 @@ function bind() {
     advance({ minutes: Math.max(1, remaining) });
   });
   $("btn-revise").addEventListener("click", revise);
+  $("btn-handover").addEventListener("click", issueHandover);
+  $("btn-handover-copy").addEventListener("click", copyHandoverLink);
 }
 
 async function init() {
@@ -789,5 +975,14 @@ async function init() {
     /* offline / first run: the editor remains manually usable */
   }
 }
+
+// Test/debug hook: lets an automated two-window walkthrough verify that the
+// old page's token can no longer write after a handover.
+window.__drillDebug = () => ({
+  sessionId: state.session ? state.session.id : null,
+  ownerToken: state.ownerToken,
+  ownerEpoch: state.ownerEpoch,
+  readOnly: state.readOnly,
+});
 
 document.addEventListener("DOMContentLoaded", init);
